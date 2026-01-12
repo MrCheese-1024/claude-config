@@ -5,7 +5,7 @@ Explicit, composable abstractions over stringly-typed dicts and parameter groups
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal
+from typing import Callable, Literal, Protocol, TypeAlias
 
 
 class AgentRole(Enum):
@@ -16,6 +16,17 @@ class AgentRole(Enum):
     TECHNICAL_WRITER = "technical-writer"
     EXPLORE = "explore"
     GENERAL_PURPOSE = "general-purpose"
+
+
+class QRStatus(Enum):
+    """Quality Review result status."""
+
+    PASS = "pass"
+    FAIL = "fail"
+
+    def __bool__(self) -> bool:
+        """Allow if qr_status: checks (PASS is truthy, FAIL is falsy for gating)."""
+        return self == QRStatus.PASS
 
 
 @dataclass
@@ -41,6 +52,35 @@ class TerminalRouting:
 Routing = LinearRouting | BranchRouting | TerminalRouting
 
 
+# =============================================================================
+# Command Routing (for invoke_after)
+# =============================================================================
+
+
+@dataclass
+class FlatCommand:
+    """Single command routing (non-branching steps)."""
+
+    command: str
+
+
+@dataclass
+class BranchCommand:
+    """Conditional routing based on QR result (branching steps)."""
+
+    if_pass: str
+    if_fail: str
+
+
+NextCommand = FlatCommand | BranchCommand | None
+"""Union type for step routing.
+
+- FlatCommand: Non-branching step, single next command
+- BranchCommand: QR step, branches on pass/fail
+- None: Terminal step, no invoke_after
+"""
+
+
 @dataclass
 class Dispatch:
     """Sub-agent dispatch configuration."""
@@ -58,12 +98,17 @@ class QRState:
 
     iteration: Loop count (1=initial review, 2+=re-verification)
     failed: True when entering step to fix prior QR issues
-    status: QR result from previous step ("pass"/"fail")
+    status: QR result from previous step
     """
 
     iteration: int = 1
     failed: bool = False
-    status: Literal["pass", "fail"] | None = None
+    status: QRStatus | None = None
+
+    @property
+    def passed(self) -> bool:
+        """Check if QR passed."""
+        return self.status == QRStatus.PASS
 
 
 @dataclass
@@ -107,3 +152,37 @@ class WorkflowDefinition:
     script: str
     steps: dict[int, Step]
     description: str = ""
+
+
+# =============================================================================
+# Step Handler Pattern
+# =============================================================================
+
+
+@dataclass
+class StepGuidance:
+    """Return type for step handlers.
+
+    Replaces dict returns with explicit structure.
+    """
+
+    title: str
+    actions: list[str]
+    next_hint: str = ""
+    phase: str = ""
+    # Additional fields can be added without breaking existing handlers
+
+
+# Type alias for step handler functions
+# Handlers receive step context and return guidance
+StepHandler: TypeAlias = Callable[..., dict | StepGuidance]
+"""Step handler function signature.
+
+Args:
+    step: Current step number
+    total_steps: Total steps in workflow
+    **kwargs: Additional context (qr_iteration, qr_fail, etc.)
+
+Returns:
+    Dict or StepGuidance with title, actions, next hint
+"""
