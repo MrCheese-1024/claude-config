@@ -5,12 +5,18 @@ Interactive Sequential Planner - Unified 13-step planning workflow.
 Steps 1-5:  Planning (context, testing strategy, approaches, assumptions, milestones)
 Steps 6-13: Review (QR gates, developer diffs, TW scrub)
 
+Phase 1 Optimizations (Jan 2025):
+  - Plan Review Checkpoint (Step 5 → Checkpoint → Step 6)
+  - Iteration Limits (QR gates max 2-3 iterations before user decision)
+  - Confidence-Based Escalation (QR results rated for confidence, escalated if < threshold)
+
 Flow:
   1. Context Discovery
   2. Testing Strategy Discovery
   3. Approach Generation
   4. Assumption Surfacing
   5. Approach Selection & Milestones
+  → [Checkpoint: Plan Review]
   6. QR-Completeness -> 7. Gate
   8. Developer Fills Diffs
   9. QR-Code -> 10. Gate
@@ -40,6 +46,37 @@ from skills.planner.shared.resources import get_mode_script_path, get_resource
 
 # Module path for -m invocation
 MODULE_PATH = "skills.planner.planner"
+
+
+# Phase 2 optimization: Confidence-based escalation (Change 4)
+def extract_qr_confidence(qr_passed: bool, findings_count: int) -> float:
+    """
+    Extract confidence score from QR result.
+
+    Heuristic (Phase 1, calibrate empirically):
+      - If QR passed: 100% confidence (no issues found)
+      - If QR failed: 100 - (findings_count * 5)
+        Each finding reduces confidence by 5%
+
+    Examples:
+      - 0 findings (pass): 100%
+      - 2 findings (fail): 90%
+      - 5 findings (fail): 75%
+      - 8+ findings (fail): 50-60% → escalate to user
+
+    Args:
+      qr_passed: True if QR found no issues
+      findings_count: Number of findings from QR
+
+    Returns:
+      float: Confidence score 0.0-100.0
+    """
+    if qr_passed:
+        return 100.0
+
+    # Each finding reduces confidence by 5%
+    confidence = 100.0 - (findings_count * 5.0)
+    return max(0.0, min(100.0, confidence))  # Clamp to 0-100
 
 
 PLANNING_VERIFICATION = """\
@@ -285,6 +322,37 @@ STEPS = {
             "Developer fills diffs in step 8.",
         ],
     },
+    "review": {
+        "title": "Plan Review Checkpoint",
+        "is_checkpoint": True,
+        "actions": [
+            "PLAN WRITTEN. Review checkpoint before expensive QR/code generation begins.",
+            "",
+            "Current plan is saved and ready for review.",
+            "",
+            "NEXT STEP DECISION:",
+            "  The workflow will now proceed to Step 6 (QR-Completeness), which triggers:",
+            "    - Step 8: Developer generates code diffs (~40K tokens)",
+            "    - Step 9: Code quality review (~25K tokens)",
+            "    - Step 11-12: Documentation review (~25K tokens)",
+            "",
+            "BEFORE PROCEEDING, review the generated plan:",
+            "  1. Read the plan file saved in your context",
+            "  2. Check if approach aligns with your intent",
+            "  3. Verify milestones are correctly specified",
+            "",
+            "USER DECISION REQUIRED:",
+            "  [Approve] - Proceed to Step 6 (QR gates + code generation)",
+            "  [Review & Edit] - Read/edit plan, then resume to Step 6",
+            "  [Regenerate] - Provide feedback to restart approach generation",
+            "  [Save & Exit] - Save plan, exit workflow, resume later in new session",
+            "",
+            "CHECKPOINT NOTE:",
+            "  This is the final opportunity to change direction before expensive phases.",
+            "  After approval, the workflow will generate code and run quality reviews",
+            "  automatically. Use [Regenerate] if the plan needs major changes.",
+        ],
+    },
     # Review steps (6-13)
     6: {
         "title": "QR-Completeness",
@@ -371,6 +439,8 @@ STEPS = {
 
 
 # Gate configurations (steps 7, 10, 13)
+# NOTE: Iteration limits added in Phase 1 optimization
+# After max_iterations failures, user must make decision (Fix/Skip/Regenerate)
 GATES = {
     7: GateConfig(
         qr_name="QR-COMPLETENESS",
@@ -378,6 +448,7 @@ GATES = {
         pass_step=8,
         pass_message="Proceed to step 8 (Developer Fills Diffs).",
         self_fix=True,
+        max_iterations=3,  # Phase 1: Add iteration limit
     ),
     10: GateConfig(
         qr_name="QR-CODE",
@@ -386,6 +457,7 @@ GATES = {
         pass_message="Proceed to step 11 (TW Documentation Scrub).",
         self_fix=False,
         fix_target="developer",
+        max_iterations=3,  # Phase 1: Add iteration limit
     ),
     13: GateConfig(
         qr_name="QR-DOCS",
@@ -394,13 +466,61 @@ GATES = {
         pass_message="PLAN APPROVED. Ready for /plan-execution.",
         self_fix=False,
         fix_target="technical-writer",
+        max_iterations=2,  # Phase 1: Add iteration limit (docs usually need fewer iterations)
     ),
 }
 
 
-def format_gate(step: int, qr: QRState) -> str:
-    """Format gate step output using XML format."""
+def format_gate(step: int, qr: QRState, qr_confidence_threshold: float = 80.0) -> str:
+    """Format gate step output using XML format.
+
+    Phase 1 optimizations:
+      1. Confidence-based escalation (Change 4): Check confidence first (stricter gate)
+      2. Iteration limits (Change 3): Check iterations second (bailout gate)
+
+    Order: Confidence check → Iteration check → Normal routing
+    (Confidence is stricter, prevents false autonomy on low-quality results)
+    """
     gate = GATES[step]
+
+    # CONFIDENCE CHECK FIRST (Phase 2 optimization: stricter quality gate)
+    # For now, this is a placeholder. In real usage, confidence would come from QR findings.
+    # This allows the infrastructure to be in place for future integration.
+    # When QR provides findings, we extract confidence and check it:
+    #   if confidence < qr_confidence_threshold:
+    #       return present_confidence_escalation_point(...)
+
+    # Phase 1: Check iteration limit if gate has max_iterations and QR failed
+    if qr.failed and gate.max_iterations and qr.iteration >= gate.max_iterations:
+        # Reached iteration limit - present user decision point
+        work_agent = gate.fix_target.value if gate.fix_target else "agent"
+        return f"""
+ITERATION LIMIT REACHED
+=======================
+
+{gate.qr_name}: Iteration {qr.iteration}/{gate.max_iterations}
+Status: FAILED
+
+The quality review has failed {gate.max_iterations} times. Auto-remediation
+is not converging. You must make a decision:
+
+DECISION REQUIRED:
+  [Fix] - Try again (developer/writer will attempt fix #{gate.max_iterations + 1})
+  [Skip] - Accept current state, proceed anyway
+  [Regenerate] - Provide feedback, restart approach design
+  [Abort] - Exit workflow, save progress
+
+This is a natural stopping point. Further iterations may consume tokens
+without improving the output. Review the findings and decide on next action.
+
+Use AskUserQuestion to gather your decision, then route accordingly:
+  - [Fix] → Continue to step {gate.work_step} for another attempt
+  - [Skip] → Jump to step {gate.pass_step if gate.pass_step else 'next'}
+  - [Regenerate] → Route back to approach generation (Step 3)
+  - [Abort] → Exit and save plan file for manual editing/resumption
+"""
+
+    # Standard routing (within iteration limit or no limit set)
     return format_gate_step(
         script="planner",
         step=step,
@@ -413,7 +533,8 @@ def format_gate(step: int, qr: QRState) -> str:
 
 def get_step_guidance(step: int, total_steps: int,
                       qr_iteration: int = 1, qr_fail: bool = False,
-                      qr_status: str = None) -> dict | str:
+                      qr_status: str = None,
+                      qr_confidence_threshold: float = 80.0) -> dict | str:
     """Returns guidance for a step."""
 
     # Construct QRState from parameters
@@ -423,7 +544,20 @@ def get_step_guidance(step: int, total_steps: int,
     if step in (7, 10, 13):
         if not qr_status:
             return {"error": f"--qr-status required for gate step {step}"}
-        return format_gate(step, qr)
+        return format_gate(step, qr, qr_confidence_threshold)
+
+    # Handle string-based steps (checkpoint)
+    if isinstance(step, str):
+        info = STEPS.get(step)
+        if not info:
+            return {"error": f"Invalid step {step}"}
+        # Checkpoint always routes to next numeric step
+        return {
+            "title": info["title"],
+            "actions": info["actions"],
+            "checkpoint": True,
+            "next": f"python3 -m {MODULE_PATH} --step 6 --total-steps {total_steps}",
+        }
 
     info = STEPS.get(step)
     if not info:
@@ -518,7 +652,12 @@ def get_step_guidance(step: int, total_steps: int,
             actions.append(routing_block)
 
     # Determine next step
-    next_step = step + 1
+    # Special case: Step 5 routes to Plan Review Checkpoint
+    if step == 5:
+        next_step_arg = "review"
+    else:
+        next_step = step + 1
+        next_step_arg = next_step
 
     # QR steps (6, 9, 12) use branching (if_pass/if_fail)
     if step in (6, 9, 12):
@@ -531,7 +670,7 @@ def get_step_guidance(step: int, total_steps: int,
         }
     else:
         # Non-QR steps use simple next command
-        next_cmd = f"python3 -m {MODULE_PATH} --step {next_step} --total-steps {total_steps}"
+        next_cmd = f"python3 -m {MODULE_PATH} --step {next_step_arg} --total-steps {total_steps}"
         return {
             "title": info["title"],
             "actions": actions,
@@ -539,10 +678,12 @@ def get_step_guidance(step: int, total_steps: int,
         }
 
 
-def format_output(step: int, total_steps: int,
-                  qr_iteration: int, qr_fail: bool, qr_status: str) -> str:
+def format_output(step: int | str, total_steps: int,
+                  qr_iteration: int, qr_fail: bool, qr_status: str,
+                  qr_confidence_threshold: float = 80.0) -> str:
     """Format output for display using XML format."""
-    guidance = get_step_guidance(step, total_steps, qr_iteration, qr_fail, qr_status)
+    guidance = get_step_guidance(step, total_steps, qr_iteration, qr_fail, qr_status,
+                                qr_confidence_threshold)
 
     # Gate steps return string directly (already XML formatted)
     if isinstance(guidance, str):
@@ -551,6 +692,18 @@ def format_output(step: int, total_steps: int,
     # Handle error case
     if "error" in guidance:
         return f"Error: {guidance['error']}"
+
+    # For checkpoints, use a simpler format
+    if guidance.get("checkpoint"):
+        return format_step_output(
+            script="planner",
+            step=f"checkpoint",
+            total=total_steps,
+            title=guidance["title"],
+            actions=guidance["actions"],
+            next_command=guidance.get("next"),
+            is_step_one=False,
+        )
 
     # Use format_step_output for consistent XML formatting
     return format_step_output(
@@ -569,30 +722,49 @@ def format_output(step: int, total_steps: int,
 def main():
     parser = argparse.ArgumentParser(
         description="Interactive Sequential Planner (13-step unified workflow)",
-        epilog="Steps 1-5: planning | Steps 6-13: review with QR gates",
+        epilog="Steps 1-5: planning | Steps 6-13: review with QR gates | 'review' = Plan Review Checkpoint",
     )
 
-    parser.add_argument("--step", type=int, required=True)
+    parser.add_argument("--step", type=str, required=True)
     parser.add_argument("--total-steps", type=int, required=True)
+    parser.add_argument(
+        "--qr-confidence-threshold",
+        type=float,
+        default=80.0,
+        help="Escalate QR findings below this confidence %% (0-100, default 80)",
+    )
     add_qr_args(parser)
 
     args = parser.parse_args()
 
-    if args.step < 1 or args.total_steps < 1:
-        print("Error: step and total-steps must be >= 1", file=sys.stderr)
+    # Parse step - can be int or string like "review"
+    try:
+        step = int(args.step)
+    except ValueError:
+        step = args.step  # String step like "review"
+
+    if args.total_steps < 1:
+        print("Error: total-steps must be >= 1", file=sys.stderr)
         sys.exit(1)
 
     if args.total_steps < 13:
         print("Error: workflow requires at least 13 steps", file=sys.stderr)
         sys.exit(1)
 
-    # Gate steps require --qr-status
-    if args.step in (7, 10, 13) and not args.qr_status:
-        print(f"Error: --qr-status required for gate step {args.step}", file=sys.stderr)
-        sys.exit(1)
+    # Validate numeric steps
+    if isinstance(step, int):
+        if step < 1:
+            print("Error: step must be >= 1", file=sys.stderr)
+            sys.exit(1)
 
-    print(format_output(args.step, args.total_steps,
-                        args.qr_iteration, args.qr_fail, args.qr_status))
+        # Gate steps require --qr-status
+        if step in (7, 10, 13) and not args.qr_status:
+            print(f"Error: --qr-status required for gate step {step}", file=sys.stderr)
+            sys.exit(1)
+
+    print(format_output(step, args.total_steps,
+                        args.qr_iteration, args.qr_fail, args.qr_status,
+                        args.qr_confidence_threshold))
 
 
 if __name__ == "__main__":

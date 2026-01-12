@@ -74,4 +74,22 @@ Skip when task is:
 8. Doc QR Gate - route to step 6 on fail
 9. Retrospective - summary presentation
 
+**Execution Separation (Phase 1 Optimization):**
+
+Execution can be invoked independently from planning in a separate session:
+
+1. Complete planning workflow (invoke with "plan" intent)
+2. Review approved plan and save location
+3. Clear context / start new session
+4. Invoke execution with approved plan:
+   ```
+   <invoke working-dir=".claude/skills/scripts" cmd="python3 -m skills.planner.executor --step 1 --total-steps 9" />
+   ```
+5. Provide plan file path to executor via context
+
+This separation allows you to:
+- Keep planning and execution in different token budgets (fresh 200K per session)
+- Review/edit plan between planning and execution
+- Execute approved plans in fresh sessions without re-planning
+
 Scripts inject step-specific guidance. Invoke and follow output.

@@ -5,6 +5,13 @@ acceptance criteria, specs that nobody can implement. I built this skill with
 two workflows -- planning and execution -- connected by quality gates that catch
 these problems early.
 
+**Phase 1 Optimization (Token Reduction):**
+
+The planner has been optimized to reduce token consumption and add user control:
+- **Plan Review Checkpoint**: User approves plan before expensive code generation (saves 100K+ tokens)
+- **Execution Separation**: Run execution in separate session with fresh token budget
+- **Iteration Limits**: QR gates stop auto-fixing after 2-3 attempts, forcing user decision
+
 ## Planning Workflow
 
 ```

@@ -72,6 +72,10 @@ class GateConfig:
 
     self_fix controls routing: True -> agent fixes issues automatically,
     False -> manual intervention required.
+
+    max_iterations (Phase 1 optimization): Max auto-fix attempts before user
+    decision point. None = unlimited (legacy behavior). After max reached,
+    user must choose: Fix/Skip/Regenerate/Abort.
     """
 
     qr_name: str
@@ -80,6 +84,7 @@ class GateConfig:
     pass_message: str
     self_fix: bool
     fix_target: AgentRole | None = None
+    max_iterations: int | None = None  # Phase 1: iteration limit
 
 
 @dataclass
