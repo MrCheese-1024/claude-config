@@ -4,14 +4,14 @@ Prompt optimization skill. IMMEDIATELY invoke the script -- do NOT explore or an
 
 ## Files
 
-| File                  | What              | When to read         |
-| --------------------- | ----------------- | -------------------- |
-| `SKILL.md`            | Skill invocation  | Using this skill     |
-| `README.md`           | Architecture      | Understanding design |
-| `scripts/optimize.py` | Complete workflow | Debugging behavior   |
+| File        | What             | When to read         |
+| ----------- | ---------------- | -------------------- |
+| `SKILL.md`  | Skill invocation | Using this skill     |
+| `README.md` | Architecture     | Understanding design |
 
 ## Subdirectories
 
-| Directory     | What                          | When to read     |
-| ------------- | ----------------------------- | ---------------- |
-| `references/` | Prompt engineering techniques | Script instructs |
+| Directory     | What                          | When to read                |
+| ------------- | ----------------------------- | --------------------------- |
+| `papers/`     | Source papers by category     | Verifying technique origins |
+| `references/` | Prompt engineering techniques | Script instructs            |

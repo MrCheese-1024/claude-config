@@ -5,18 +5,12 @@ Interactive Sequential Planner - Unified 13-step planning workflow.
 Steps 1-5:  Planning (context, testing strategy, approaches, assumptions, milestones)
 Steps 6-13: Review (QR gates, developer diffs, TW scrub)
 
-Phase 1 Optimizations (Jan 2025):
-  - Plan Review Checkpoint (Step 5 → Checkpoint → Step 6)
-  - Iteration Limits (QR gates max 2-3 iterations before user decision)
-  - Confidence-Based Escalation (QR results rated for confidence, escalated if < threshold)
-
 Flow:
   1. Context Discovery
   2. Testing Strategy Discovery
   3. Approach Generation
   4. Assumption Surfacing
   5. Approach Selection & Milestones
-  → [Checkpoint: Plan Review]
   6. QR-Completeness -> 7. Gate
   8. Developer Fills Diffs
   9. QR-Code -> 10. Gate
@@ -27,56 +21,23 @@ Flow:
 import argparse
 import sys
 
-from skills.lib.workflow.types import QRState, QRStatus, GateConfig
-from skills.lib.workflow.formatters import (
-    format_step_output,
-    format_gate_step,
-    format_invoke_after,
-    format_step_header,
-    format_current_action,
-    format_subagent_dispatch,
-    format_state_banner,
-    format_post_qr_routing,
-    format_orchestrator_constraint,
-    format_qr_banner,
+from skills.lib.workflow.types import QRState, QRStatus, GateConfig, AgentRole, Dispatch, LoopState
+from skills.lib.workflow.core import (
+    Workflow,
+    StepDef,
+    StepContext,
+    Outcome,
 )
+from skills.lib.workflow.ast import W, XMLRenderer, render, TextNode
 from skills.lib.workflow.cli import add_qr_args
-from skills.planner.shared.resources import get_mode_script_path, get_resource
+from skills.planner.shared.resources import get_mode_script_path, PlannerResourceProvider
 
 
 # Module path for -m invocation
 MODULE_PATH = "skills.planner.planner"
 
-
-# Phase 2 optimization: Confidence-based escalation (Change 4)
-def extract_qr_confidence(qr_passed: bool, findings_count: int) -> float:
-    """
-    Extract confidence score from QR result.
-
-    Heuristic (Phase 1, calibrate empirically):
-      - If QR passed: 100% confidence (no issues found)
-      - If QR failed: 100 - (findings_count * 5)
-        Each finding reduces confidence by 5%
-
-    Examples:
-      - 0 findings (pass): 100%
-      - 2 findings (fail): 90%
-      - 5 findings (fail): 75%
-      - 8+ findings (fail): 50-60% → escalate to user
-
-    Args:
-      qr_passed: True if QR found no issues
-      findings_count: Number of findings from QR
-
-    Returns:
-      float: Confidence score 0.0-100.0
-    """
-    if qr_passed:
-        return 100.0
-
-    # Each finding reduces confidence by 5%
-    confidence = 100.0 - (findings_count * 5.0)
-    return max(0.0, min(100.0, confidence))  # Clamp to 0-100
+# Resource provider instance
+_provider = PlannerResourceProvider()
 
 
 PLANNING_VERIFICATION = """\
@@ -191,7 +152,7 @@ If any step was skipped: STOP. Go back and complete it.
 
 def get_plan_format() -> str:
     """Read the plan format template from resources."""
-    return get_resource("plan-format.md")
+    return _provider.get_resource("plan-format.md")
 
 
 # Unified step definitions (1-13)
@@ -326,37 +287,6 @@ STEPS = {
             "Developer fills diffs in step 8.",
         ],
     },
-    "review": {
-        "title": "Plan Review Checkpoint",
-        "is_checkpoint": True,
-        "actions": [
-            "PLAN WRITTEN. Review checkpoint before expensive QR/code generation begins.",
-            "",
-            "Current plan is saved and ready for review.",
-            "",
-            "NEXT STEP DECISION:",
-            "  The workflow will now proceed to Step 6 (QR-Completeness), which triggers:",
-            "    - Step 8: Developer generates code diffs (~40K tokens)",
-            "    - Step 9: Code quality review (~25K tokens)",
-            "    - Step 11-12: Documentation review (~25K tokens)",
-            "",
-            "BEFORE PROCEEDING, review the generated plan:",
-            "  1. Read the plan file saved in your context",
-            "  2. Check if approach aligns with your intent",
-            "  3. Verify milestones are correctly specified",
-            "",
-            "USER DECISION REQUIRED:",
-            "  [Approve] - Proceed to Step 6 (QR gates + code generation)",
-            "  [Review & Edit] - Read/edit plan, then resume to Step 6",
-            "  [Regenerate] - Provide feedback to restart approach generation",
-            "  [Save & Exit] - Save plan, exit workflow, resume later in new session",
-            "",
-            "CHECKPOINT NOTE:",
-            "  This is the final opportunity to change direction before expensive phases.",
-            "  After approval, the workflow will generate code and run quality reviews",
-            "  automatically. Use [Regenerate] if the plan needs major changes.",
-        ],
-    },
     # Review steps (6-13)
     6: {
         "title": "QR-Completeness",
@@ -365,7 +295,7 @@ STEPS = {
         "is_dispatch": True,
         "dispatch_agent": "quality-reviewer",
         "mode_script": "qr/plan-completeness.py",
-        "mode_total_steps": 6,
+        "mode_total_steps": 7,  # Added step 6: Self-Validate Suggested Fixes
         "context_vars": {"PLAN_FILE": "path to the plan being reviewed"},
         "post_dispatch": [
             "The sub-agent MUST invoke the script and follow its guidance.",
@@ -396,7 +326,7 @@ STEPS = {
         "is_dispatch": True,
         "dispatch_agent": "quality-reviewer",
         "mode_script": "qr/plan-code.py",
-        "mode_total_steps": 7,
+        "mode_total_steps": 8,  # Added step 7: Self-Validate Suggested Fixes
         "context_vars": {"PLAN_FILE": "path to the plan being reviewed"},
         "post_dispatch": [
             "The sub-agent MUST invoke the script and follow its guidance.",
@@ -429,7 +359,7 @@ STEPS = {
         "is_dispatch": True,
         "dispatch_agent": "quality-reviewer",
         "mode_script": "qr/plan-docs.py",
-        "mode_total_steps": 5,
+        "mode_total_steps": 6,  # Added step 5: Self-Validate Suggested Fixes
         "context_vars": {"PLAN_FILE": "path to the plan being reviewed"},
         "post_dispatch": [
             "The sub-agent MUST invoke the script and follow its guidance.",
@@ -443,16 +373,13 @@ STEPS = {
 
 
 # Gate configurations (steps 7, 10, 13)
-# NOTE: Iteration limits added in Phase 1 optimization
-# After max_iterations failures, user must make decision (Fix/Skip/Regenerate)
 GATES = {
     7: GateConfig(
         qr_name="QR-COMPLETENESS",
-        work_step=5,  # Route to plan writing step, not QR step
+        work_step=5,
         pass_step=8,
         pass_message="Proceed to step 8 (Developer Fills Diffs).",
         self_fix=True,
-        max_iterations=3,  # Phase 1: Add iteration limit
     ),
     10: GateConfig(
         qr_name="QR-CODE",
@@ -460,135 +387,28 @@ GATES = {
         pass_step=11,
         pass_message="Proceed to step 11 (TW Documentation Scrub).",
         self_fix=False,
-        fix_target="developer",
-        max_iterations=3,  # Phase 1: Add iteration limit
+        fix_target=AgentRole.DEVELOPER,
     ),
     13: GateConfig(
         qr_name="QR-DOCS",
         work_step=11,
         pass_step=None,
-        pass_message="PLAN APPROVED. Ready for /plan-execution.",
+        pass_message="PLAN APPROVED. Ready for plan execution.",
         self_fix=False,
-        fix_target="technical-writer",
-        max_iterations=2,  # Phase 1: Add iteration limit (docs usually need fewer iterations)
+        fix_target=AgentRole.TECHNICAL_WRITER,
     ),
 }
 
 
-def format_gate(step: int, qr: QRState, qr_confidence_threshold: float = 80.0) -> str:
-    """Format gate step output using XML format.
-
-    Phase 1 optimizations:
-      1. Confidence-based escalation (Change 4): Check confidence first (stricter gate)
-      2. Iteration limits (Change 3): Check iterations second (bailout gate)
-
-    Order: Confidence check → Iteration check → Normal routing
-    (Confidence is stricter, prevents false autonomy on low-quality results)
-    """
-    gate = GATES[step]
-
-    # CONFIDENCE CHECK FIRST (Phase 2 optimization: stricter quality gate)
-    # For now, this is a placeholder. In real usage, confidence would come from QR findings.
-    # This allows the infrastructure to be in place for future integration.
-    # When QR provides findings, we extract confidence and check it:
-    #   if confidence < qr_confidence_threshold:
-    #       return present_confidence_escalation_point(...)
-
-    # Phase 1: Check iteration limit if gate has max_iterations and QR failed
-    if qr.failed and gate.max_iterations and qr.iteration >= gate.max_iterations:
-        # Reached iteration limit - present user decision point
-        work_agent = gate.fix_target.value if gate.fix_target else "agent"
-        return f"""
-ITERATION LIMIT REACHED
-=======================
-
-{gate.qr_name}: Iteration {qr.iteration}/{gate.max_iterations}
-Status: FAILED
-
-The quality review has failed {gate.max_iterations} times. Auto-remediation
-is not converging. You must make a decision:
-
-DECISION REQUIRED:
-  [Fix] - Try again (developer/writer will attempt fix #{gate.max_iterations + 1})
-  [Skip] - Accept current state, proceed anyway
-  [Regenerate] - Provide feedback, restart approach design
-  [Abort] - Exit workflow, save progress
-
-This is a natural stopping point. Further iterations may consume tokens
-without improving the output. Review the findings and decide on next action.
-
-Use AskUserQuestion to gather your decision, then route accordingly:
-  - [Fix] → Continue to step {gate.work_step} for another attempt
-  - [Skip] → Jump to step {gate.pass_step if gate.pass_step else 'next'}
-  - [Regenerate] → Route back to approach generation (Step 3)
-  - [Abort] → Exit and save plan file for manual editing/resumption
-"""
-
-    # Standard routing (within iteration limit or no limit set)
-    return format_gate_step(
-        script="planner",
-        step=step,
-        total=13,
-        gate=gate,
-        qr=qr,
-        cmd_template=f"python3 -m {MODULE_PATH}",
-    )
+def step_gate_handler(step_info: dict, step: int, qr: QRState, **kwargs) -> str:
+    """Handle gate steps (7, 10, 13)."""
+    return format_gate(step, qr)
 
 
-def get_step_guidance(step: int, total_steps: int,
-                      qr_iteration: int = 1, qr_fail: bool = False,
-                      qr_status: str = None,
-                      qr_confidence_threshold: float = 80.0) -> dict | str:
-    """Returns guidance for a step."""
-
-    # Construct QRState from parameters
-    status = QRStatus(qr_status) if qr_status else None
-    qr = QRState(iteration=qr_iteration, failed=qr_fail, status=status)
-
-    # Gate steps (7, 10, 13) use shared gate function
-    if step in (7, 10, 13):
-        if not qr_status:
-            return {"error": f"--qr-status required for gate step {step}"}
-        return format_gate(step, qr, qr_confidence_threshold)
-
-    # Handle string-based steps (checkpoint)
-    if isinstance(step, str):
-        info = STEPS.get(step)
-        if not info:
-            return {"error": f"Invalid step {step}"}
-        # Checkpoint always routes to next numeric step
-        return {
-            "title": info["title"],
-            "actions": info["actions"],
-            "checkpoint": True,
-            "next": f"python3 -m {MODULE_PATH} --step 6 --total-steps {total_steps}",
-        }
-
-    info = STEPS.get(step)
-    if not info:
-        return {"error": f"Invalid step {step}"}
-
-    # Build actions
-    actions = list(info.get("actions", []))
-
-    # Add verification checklist for step 4
-    if info.get("include_verification"):
-        actions.append("")
-        actions.append(PLANNING_VERIFICATION)
-
-    # Add plan format for step 5
-    if info.get("include_plan_format"):
-        plan_format = get_plan_format()
-        actions.extend([
-            "",
-            "Write plan using this format:",
-            "",
-            plan_format,
-        ])
-
-    # Handle planning step 5 in fix mode (main agent fixes plan structure)
-    if step == 5 and qr.failed:
-        banner = format_state_banner("PLAN-FIX", qr.iteration, "fix")
+def step_5_handler(step_info: dict, step: int, qr: QRState, total_steps: int, **kwargs) -> dict:
+    """Handle step 5 (planning) in normal or fix mode."""
+    if qr.state == LoopState.RETRY:
+        banner = render(W.el("state_banner", checkpoint="PLAN-FIX", iteration=str(qr.iteration), mode="fix").build(), XMLRenderer())
         fix_actions = [banner, ""] + [
             "FIX MODE: QR-COMPLETENESS found plan structure issues.",
             "",
@@ -604,91 +424,520 @@ def get_step_guidance(step: int, total_steps: int,
             "Use Edit tool to fix the plan file.",
             "After fixing, proceed to QR-Completeness for fresh verification.",
         ]
-        # After fix, proceed to step 6 (QR-Completeness) for fresh review
         return {
-            "title": f"{info['title']} - Fix Mode",
+            "title": f"{step_info['title']} - Fix Mode",
             "actions": fix_actions,
             "next": f"python3 -m {MODULE_PATH} --step 6 --total-steps {total_steps}",
         }
+    return None
 
-    # Add QR banner for QR steps
-    if info.get("is_qr"):
-        qr_name = info.get("qr_name", "QR")
-        actions.insert(0, format_qr_banner(qr_name, qr))
-        actions.insert(1, "")
+
+def step_dispatch_handler(step_info: dict, step: int, qr: QRState, **kwargs) -> list:
+    """Add QR banner for QR dispatch steps."""
+    if step_info.get("is_qr"):
+        qr_name = step_info.get("qr_name", "QR")
+        banner = render(W.el("state_banner", checkpoint=qr_name, iteration=str(qr.iteration), mode="fresh_review").build(), XMLRenderer())
+        return [banner, ""]
+    return []
+
+
+def step_verification_handler(step_info: dict, **kwargs) -> list:
+    """Add verification checklist for step 5."""
+    if step_info.get("include_verification"):
+        return ["", PLANNING_VERIFICATION]
+    return []
+
+
+def step_format_handler(step_info: dict, **kwargs) -> list:
+    """Add plan format for step 5."""
+    if step_info.get("include_plan_format"):
+        plan_format = get_plan_format()
+        return ["", "Write plan using this format:", "", plan_format]
+    return []
+
+
+STEP_HANDLERS = {
+    5: step_5_handler,
+    7: step_gate_handler,
+    10: step_gate_handler,
+    13: step_gate_handler,
+}
+
+
+def step_handler_noop(ctx: StepContext) -> tuple[Outcome, dict]:
+    """Generic handler for output-only steps."""
+    return Outcome.OK, {}
+
+
+def step_gate_passthrough(ctx: StepContext) -> tuple[Outcome, dict]:
+    """Pass-through handler for gate routing steps."""
+    return Outcome.OK, {}
+
+
+WORKFLOW = Workflow(
+    "planner",
+    StepDef(
+        id="context_discovery",
+        title="Context Discovery",
+        actions=STEPS[1]["actions"],
+        handler=Dispatch(
+            agent=AgentRole.EXPLORE,
+            script="skills.planner.explore",
+            total_steps=5,
+            context_vars={
+                "TASK": "the user's task/request being planned",
+                "DECISION_CRITERIA": "what planning decisions will consume this output",
+            },
+        ),
+        next={Outcome.OK: "testing_strategy"},
+    ),
+    StepDef(
+        id="testing_strategy",
+        title="Testing Strategy Discovery",
+        actions=STEPS[2]["actions"],
+        handler=step_handler_noop,
+        next={Outcome.OK: "approach_generation"},
+    ),
+    StepDef(
+        id="approach_generation",
+        title="Approach Generation",
+        actions=STEPS[3]["actions"],
+        handler=step_handler_noop,
+        next={Outcome.OK: "assumption_surfacing"},
+    ),
+    StepDef(
+        id="assumption_surfacing",
+        title="Assumption Surfacing",
+        actions=STEPS[4]["actions"],
+        handler=step_handler_noop,
+        next={Outcome.OK: "approach_selection"},
+    ),
+    StepDef(
+        id="approach_selection",
+        title="Approach Selection & Milestones",
+        actions=STEPS[5]["actions"],
+        handler=step_handler_noop,
+        next={Outcome.OK: "qr_completeness"},
+    ),
+    StepDef(
+        id="qr_completeness",
+        title="QR-Completeness",
+        actions=[],
+        handler=Dispatch(
+            agent=AgentRole.QUALITY_REVIEWER,
+            script="skills.planner.qr.plan_completeness",
+            total_steps=7,  # Added step 6: Self-Validate Suggested Fixes
+            context_vars={"PLAN_FILE": "path to the plan being reviewed"},
+        ),
+        next={Outcome.OK: "qr_completeness_gate", Outcome.FAIL: "qr_completeness_gate"},
+    ),
+    StepDef(
+        id="qr_completeness_gate",
+        title="QR-Completeness Gate",
+        actions=[],
+        handler=step_gate_passthrough,
+        next={Outcome.OK: "developer_fills_diffs", Outcome.FAIL: "approach_selection"},
+    ),
+    StepDef(
+        id="developer_fills_diffs",
+        title="Developer Fills Diffs",
+        actions=[],
+        handler=Dispatch(
+            agent=AgentRole.DEVELOPER,
+            script="skills.planner.dev.fill_diffs",
+            total_steps=4,
+            context_vars={"PLAN_FILE": "path to the plan being reviewed"},
+        ),
+        next={Outcome.OK: "qr_code"},
+    ),
+    StepDef(
+        id="qr_code",
+        title="QR-Code",
+        actions=[],
+        handler=Dispatch(
+            agent=AgentRole.QUALITY_REVIEWER,
+            script="skills.planner.qr.plan_code",
+            total_steps=7,
+            context_vars={"PLAN_FILE": "path to the plan being reviewed"},
+        ),
+        next={Outcome.OK: "qr_code_gate", Outcome.FAIL: "qr_code_gate"},
+    ),
+    StepDef(
+        id="qr_code_gate",
+        title="QR-Code Gate",
+        actions=[],
+        handler=step_gate_passthrough,
+        next={Outcome.OK: "tw_documentation_scrub", Outcome.FAIL: "developer_fills_diffs"},
+    ),
+    StepDef(
+        id="tw_documentation_scrub",
+        title="TW Documentation Scrub",
+        actions=[],
+        handler=Dispatch(
+            agent=AgentRole.TECHNICAL_WRITER,
+            script="skills.planner.tw.plan_scrub",
+            total_steps=6,
+            context_vars={"PLAN_FILE": "path to the plan being reviewed"},
+        ),
+        next={Outcome.OK: "qr_docs"},
+    ),
+    StepDef(
+        id="qr_docs",
+        title="QR-Docs",
+        actions=[],
+        handler=Dispatch(
+            agent=AgentRole.QUALITY_REVIEWER,
+            script="skills.planner.qr.plan_docs",
+            total_steps=6,  # Added step 5: Self-Validate Suggested Fixes
+            context_vars={"PLAN_FILE": "path to the plan being reviewed"},
+        ),
+        next={Outcome.OK: "qr_docs_gate", Outcome.FAIL: "qr_docs_gate"},
+    ),
+    StepDef(
+        id="qr_docs_gate",
+        title="QR-Docs Gate",
+        actions=[],
+        handler=step_gate_passthrough,
+        next={Outcome.OK: None, Outcome.FAIL: "tw_documentation_scrub"},
+    ),
+    description="Interactive sequential planner with QR gates",
+)
+
+
+def format_gate(step: int, qr: QRState) -> str:
+    """Format gate step output using XML format."""
+    from skills.lib.workflow.ast.nodes import ElementNode
+    from skills.lib.workflow.constants import QR_ITERATION_LIMIT, get_blocking_severities
+
+    gate = GATES[step]
+    parts = []
+
+    # Step header
+    parts.append(render(
+        W.el("step_header", TextNode(f"{gate.qr_name} Gate"),
+            script="planner", step=str(step), total="13"
+        ).build(),
+        XMLRenderer()
+    ))
+    parts.append("")
+
+    # Gate result
+    if qr.passed:
+        parts.append(f'<gate_result status="pass">GATE PASSED</gate_result>')
+    else:
+        parts.append(f'<gate_result status="fail">GATE FAILED (iteration {qr.iteration} of {QR_ITERATION_LIMIT})</gate_result>')
+    parts.append("")
+
+    # Actions
+    actions = []
+    if qr.passed:
+        actions.append(gate.pass_message)
+        actions.append("")
+        actions.append("<forbidden>")
+        actions.append("Asking the user whether to proceed - the workflow is deterministic")
+        actions.append("Offering alternatives to the next step - all steps are mandatory")
+        actions.append("Interpreting 'proceed' as optional - EXECUTE immediately")
+        actions.append("</forbidden>")
+    else:
+        # Pedantic mode reminder
+        actions.append("<pedantic_enforcement>")
+        actions.append("QR exists to catch problems BEFORE they reach production.")
+        actions.append("See <severity_filter> below for which severities block at this iteration.")
+        actions.append("</pedantic_enforcement>")
+        actions.append("")
+
+        # Severity filter
+        blocking = get_blocking_severities(qr.iteration)
+        if blocking == {"MUST", "SHOULD", "COULD"}:
+            actions.append("<severity_filter>")
+            actions.append(f"ITERATION {qr.iteration} of {QR_ITERATION_LIMIT}: All severities block (MUST, SHOULD, COULD)")
+            actions.append("Fix ALL issues reported by QR before proceeding.")
+            actions.append("</severity_filter>")
+            actions.append("")
+        elif blocking == {"MUST", "SHOULD"}:
+            actions.append("<severity_filter>")
+            actions.append(f"ITERATION {qr.iteration} of {QR_ITERATION_LIMIT}: Only MUST and SHOULD severities block")
+            actions.append("COULD severity issues (DEAD_CODE, FORMATTER_FIXABLE, MINOR_INCONSISTENCY) may be deferred.")
+            actions.append("Focus on MUST and SHOULD issues. COULD issues are noted but do not block.")
+            actions.append("</severity_filter>")
+            actions.append("")
+        else:
+            actions.append("<severity_filter>")
+            actions.append(f"ITERATION {qr.iteration} of {QR_ITERATION_LIMIT}: Only MUST severity blocks")
+            actions.append("SHOULD and COULD severity issues may be deferred.")
+            actions.append("Focus ONLY on MUST issues (knowledge loss, unrecoverable if missed).")
+            actions.append("SHOULD issues (structural debt) are noted but do not block.")
+            actions.append("COULD issues (cosmetic) are noted but do not block.")
+            actions.append("")
+            actions.append("If NO MUST issues remain, this gate PASSES despite SHOULD/COULD issues.")
+            actions.append("</severity_filter>")
+            actions.append("")
+
+        next_iteration = qr.iteration + 1
+        if next_iteration > QR_ITERATION_LIMIT:
+            actions.append("<iteration_limit_reached>")
+            actions.append(f"QR has failed {qr.iteration} times at this checkpoint.")
+            actions.append("")
+            actions.append("NOTE: At iteration 5+, only MUST severity issues should block.")
+            actions.append("If QR is reporting SHOULD/COULD issues only, consider proceeding.")
+            actions.append("")
+            actions.append("MANDATORY: Use AskUserQuestion NOW:")
+            actions.append(f"  question: 'QR has found issues across {QR_ITERATION_LIMIT} iterations. How to proceed?'")
+            actions.append("  header: 'QR Loop'")
+            actions.append("  options:")
+            actions.append("    - label: 'Continue iterating'")
+            actions.append("      description: 'Keep fixing until QR passes'")
+            actions.append("    - label: 'Fix MUST issues only'")
+            actions.append("      description: 'Accept SHOULD/COULD issues, fix MUST issues'")
+            actions.append("    - label: 'Skip this check'")
+            actions.append("      description: 'Accept current state, note remaining issues'")
+            actions.append("    - label: 'Abort'")
+            actions.append("      description: 'Stop and review'")
+            actions.append("")
+            actions.append("<human_override_recording>")
+            actions.append("If user selects 'Skip this check' or 'Fix MUST issues only':")
+            actions.append("")
+            actions.append("1. Record accepted risks to plan's Decision Log:")
+            actions.append("   Add to ## Decision Log section (create if missing):")
+            actions.append("   | Issue | Rationale | Iteration |")
+            actions.append("   | ----- | --------- | --------- |")
+            actions.append(f"   | [Each MUST issue text] | [User's selected option] | {qr.iteration} |")
+            actions.append("")
+            actions.append("2. Instruct TW to add :TODO: comments at code locations:")
+            actions.append("   For each accepted MUST issue with a file/line reference:")
+            actions.append("   Delegate to @agent-technical-writer in free-form mode:")
+            actions.append("   'Add :TODO: comments at [file:line] marking accepted risk: [issue text]'")
+            actions.append("</human_override_recording>")
+            actions.append("</iteration_limit_reached>")
+            actions.append("")
+            actions.append("<when_user_says_continue>")
+            actions.append("When user selects 'Continue iterating':")
+            actions.append("  1. IMMEDIATELY invoke the exact command from <invoke_after> below")
+            actions.append("  2. The Python script provides the fix guidance - invoke it first")
+            actions.append("  3. Iteration counter is already incremented in the command")
+            actions.append("</when_user_says_continue>")
+            actions.append("")
+
+        # Gate routing
+        if gate.self_fix:
+            actions.append("NEXT ACTION:")
+            actions.append("  Invoke the command in <invoke_after> below.")
+            actions.append("  The next step will provide fix guidance for plan structure issues.")
+            actions.append("")
+        else:
+            fix_target = gate.fix_target.value if gate.fix_target else "developer"
+            actions.append("NEXT ACTION:")
+            actions.append("  Invoke the command in <invoke_after> below.")
+            actions.append(f"  The next step will dispatch {fix_target} with fix guidance.")
+            actions.append("")
+            actions.append("<qr_report_path_passthrough>")
+            actions.append("QR_REPORT_PATH from QR output MUST be passed to the work step.")
+            actions.append("You do NOT read this file. The sub-agent reads it.")
+            actions.append("</qr_report_path_passthrough>")
+            actions.append("")
+
+        actions.append("<forbidden>")
+        actions.append("Fixing issues directly from this gate step")
+        actions.append("Spawning agents directly from this gate step")
+        actions.append("Using Edit/Write tools yourself")
+        actions.append("Proceeding without invoking the next step")
+        actions.append("Interpreting 'minor issues' as skippable")
+        actions.append("</forbidden>")
+
+    parts.append("<workflow>")
+    action_nodes = [TextNode(a) for a in actions]
+    parts.append(render(W.el("current_action", *action_nodes).build(), XMLRenderer()))
+    parts.append("")
+
+    # Determine next command
+    if qr.passed and gate.pass_step is not None:
+        next_cmd = f"python3 -m {MODULE_PATH} --step {gate.pass_step} --total-steps 13"
+    else:
+        next_iteration = qr.iteration + 1
+        next_cmd = f"python3 -m {MODULE_PATH} --step {gate.work_step} --total-steps 13 --qr-fail --qr-iteration {next_iteration}"
+
+    parts.append(render(W.el("invoke_after", TextNode(next_cmd)).build(), XMLRenderer()))
+    parts.append("")
+    parts.append(render(
+        W.el("next",
+            TextNode("After current_action completes, execute invoke_after."),
+            TextNode(f"Re-read now: {next_cmd}"),
+            required="true"
+        ).build(),
+        XMLRenderer()
+    ))
+    parts.append("</workflow>")
+
+    return "\n".join(parts)
+
+
+def generic_step_handler(step_info, step, total_steps, **kwargs):
+    """Generic handler for standard steps without special logic."""
+    actions = list(step_info.get("actions", []))
+    actions.extend(step_verification_handler(step_info))
+    actions.extend(step_format_handler(step_info))
+
+    qr = kwargs.get("qr", QRState())
+    qr_banner = step_dispatch_handler(step_info, step=step, qr=qr)
+    if qr_banner:
+        actions[0:0] = qr_banner
 
     # Generate dispatch block for dispatch steps
-    if info.get("is_dispatch"):
-        mode_script = get_mode_script_path(info["mode_script"])
-        mode_total_steps = info.get("mode_total_steps", 5)
-        dispatch_agent = info.get("dispatch_agent", "agent")
-        context_vars = info.get("context_vars", {})
+    if step_info.get("is_dispatch"):
+        mode_script = get_mode_script_path(step_info["mode_script"])
+        mode_total_steps = step_info.get("mode_total_steps", 5)
+        dispatch_agent = step_info.get("dispatch_agent", "agent")
+        context_vars = step_info.get("context_vars", {})
+        qr_fail = kwargs.get("qr_fail", False)
+        qr_iteration = kwargs.get("qr_iteration", 1)
 
         # Add orchestrator constraint before dispatch
-        actions.append(format_orchestrator_constraint())
+        constraint = render(
+            W.el(
+                "orchestrator_constraint",
+                TextNode("You are the ORCHESTRATOR. You delegate, you never implement."),
+                TextNode("Your agents are highly capable. Trust them with ANY issue."),
+                TextNode("PROHIBITED: Edit, Write tools. REQUIRED: Task tool dispatch."),
+                TextNode(""),
+                TextNode("THINKING EFFICIENCY: Before dispatch, max 5 words internal reasoning."),
+                TextNode('Example thinking: "Step 1 -> need context -> dispatch Explore"'),
+                TextNode(""),
+                TextNode("The Task tool prompt you send to sub-agents should be complete."),
+            ).build(),
+            XMLRenderer(),
+        )
+        actions.append(constraint)
         actions.append("")
 
         # Build invoke command with QR flags when in fix mode
         invoke_cmd = f"python3 -m {mode_script} --step 1 --total-steps {mode_total_steps}"
-        if qr.failed:
+        if qr.state == LoopState.RETRY:
             invoke_cmd += f" --qr-fail --qr-iteration {qr.iteration}"
 
-        dispatch_block = format_subagent_dispatch(
-            agent=dispatch_agent,
-            context_vars=context_vars,
-            invoke_cmd=invoke_cmd,
-            free_form=False,
-            qr_fix_mode=qr.failed,
-        )
+        # Build dispatch block inline
+        if qr.state == LoopState.RETRY:
+            context_vars_copy = dict(context_vars)
+            context_vars_copy["QR_REPORT_PATH"] = "exact path from QR output"
+        else:
+            context_vars_copy = context_vars
+
+        dispatch_lines = [f'<subagent_dispatch agent="{dispatch_agent}" mode="script">']
+        if context_vars_copy:
+            dispatch_lines.append("  <context>")
+            for name, description in context_vars_copy.items():
+                dispatch_lines.append(f'    <var name="{name}">{description}</var>')
+            dispatch_lines.append("  </context>")
+        dispatch_lines.append(f"  <invoke>{invoke_cmd}</invoke>")
+        dispatch_lines.append("  <handoff_instruction>")
+        dispatch_lines.append(f'    Your Task tool prompt MUST begin with: "Start by invoking: {invoke_cmd}"')
+        dispatch_lines.append("    This is MANDATORY. The sub-agent follows the script, not free-form instructions.")
+        dispatch_lines.append("  </handoff_instruction>")
+        if qr.state == LoopState.RETRY:
+            dispatch_lines.append("  <qr_report_passthrough>")
+            dispatch_lines.append("    CRITICAL: Include QR_REPORT_PATH verbatim in your Task prompt.")
+            dispatch_lines.append("    DO NOT read QR_REPORT_PATH yourself.")
+            dispatch_lines.append("    DO NOT extract, summarize, or interpret the issues.")
+            dispatch_lines.append("    The sub-agent reads the file directly.")
+            dispatch_lines.append("  </qr_report_passthrough>")
+        dispatch_lines.append("</subagent_dispatch>")
+        dispatch_block = "\n".join(dispatch_lines)
         actions.append(dispatch_block)
         actions.append("")
 
         # Add post-dispatch instructions
-        post_dispatch = info.get("post_dispatch", [])
+        post_dispatch = step_info.get("post_dispatch", [])
         actions.extend(post_dispatch)
 
         # Add post-QR routing block for QR steps
-        post_qr_config = info.get("post_qr_routing")
+        post_qr_config = step_info.get("post_qr_routing")
         if post_qr_config:
-            routing_block = format_post_qr_routing(
-                self_fix=post_qr_config.get("self_fix", False),
-                fix_target=post_qr_config.get("fix_target", "developer"),
+            from skills.lib.workflow.constants import QR_ITERATION_LIMIT
+            from skills.lib.workflow.ast.nodes import ElementNode
+            fix_target = post_qr_config.get("fix_target", "developer")
+
+            routing_table = [
+                "| QR Result              | Your Action                         |",
+                "| ---------------------- | ----------------------------------- |",
+                "| PASS (no issues)       | Invoke command from <if_pass> below |",
+                "| ISSUES / concerns / *  | Invoke command from <if_fail> below |",
+            ]
+
+            routing_block = render(
+                W.el(
+                    "post_qr_routing",
+                    ElementNode("role", {}, [TextNode("You are the ORCHESTRATOR. After QR returns, your ONLY action is routing.")]),
+                    ElementNode(
+                        "pedantic_mode",
+                        {},
+                        [
+                            TextNode("EVERY issue is blocking. There are no 'minor concerns' or 'non-critical issues'."),
+                            TextNode("If QR returns ANYTHING other than clean PASS, route to <if_fail>."),
+                            TextNode(f"Defense: Max {QR_ITERATION_LIMIT} iterations, then escalate to user via AskUserQuestion."),
+                        ],
+                    ),
+                    ElementNode("routing_table", {}, [TextNode("\n".join(routing_table))]),
+                ).build(),
+                XMLRenderer(),
             )
+            actions.append("")
             actions.append(routing_block)
 
     # Determine next step
-    # Special case: Step 5 routes to Plan Review Checkpoint
-    if step == 5:
-        next_step_arg = "review"
-    else:
-        next_step = step + 1
-        next_step_arg = next_step
+    next_step = step + 1
 
     # QR steps (6, 9, 12) use branching (if_pass/if_fail)
     if step in (6, 9, 12):
         base_cmd = f"python3 -m {MODULE_PATH} --step {next_step} --total-steps {total_steps}"
         return {
-            "title": info["title"],
+            "title": step_info["title"],
             "actions": actions,
             "if_pass": f"{base_cmd} --qr-status pass",
             "if_fail": f"{base_cmd} --qr-status fail",
         }
     else:
         # Non-QR steps use simple next command
-        next_cmd = f"python3 -m {MODULE_PATH} --step {next_step_arg} --total-steps {total_steps}"
+        next_cmd = f"python3 -m {MODULE_PATH} --step {next_step} --total-steps {total_steps}"
         return {
-            "title": info["title"],
+            "title": step_info["title"],
             "actions": actions,
             "next": next_cmd,
         }
 
 
-def format_output(step: int | str, total_steps: int,
-                  qr_iteration: int, qr_fail: bool, qr_status: str,
-                  qr_confidence_threshold: float = 80.0) -> str:
+def get_step_guidance(step: int, total_steps: int,
+                      qr_iteration: int = 1, qr_fail: bool = False,
+                      qr_status: str = None) -> dict | str:
+    """Returns guidance for a step."""
+
+    status = QRStatus(qr_status) if qr_status else None
+    state = LoopState.RETRY if qr_fail else LoopState.INITIAL
+    qr = QRState(iteration=qr_iteration, state=state, status=status)
+
+    handler = STEP_HANDLERS.get(step)
+    if handler:
+        step_info = STEPS.get(step, {})
+        result = handler(step_info=step_info, step=step, qr=qr, total_steps=total_steps,
+                        qr_iteration=qr_iteration, qr_fail=qr_fail, qr_status=qr_status)
+        if isinstance(result, str):
+            return result
+        if result is not None:
+            return result
+        if not qr_status and step in (7, 10, 13):
+            return {"error": f"--qr-status required for gate step {step}"}
+
+    info = STEPS.get(step)
+    if not info:
+        return {"error": f"Invalid step {step}"}
+
+    # Use generic handler for non-special steps
+    return generic_step_handler(info, step, total_steps, qr=qr, qr_fail=qr_fail,
+                                qr_iteration=qr_iteration, qr_status=qr_status)
+
+
+def format_output(step: int, total_steps: int,
+                  qr_iteration: int, qr_fail: bool, qr_status: str) -> str:
     """Format output for display using XML format."""
-    guidance = get_step_guidance(step, total_steps, qr_iteration, qr_fail, qr_status,
-                                qr_confidence_threshold)
+    guidance = get_step_guidance(step, total_steps, qr_iteration, qr_fail, qr_status)
 
     # Gate steps return string directly (already XML formatted)
     if isinstance(guidance, str):
@@ -698,78 +947,129 @@ def format_output(step: int | str, total_steps: int,
     if "error" in guidance:
         return f"Error: {guidance['error']}"
 
-    # For checkpoints, use a simpler format
-    if guidance.get("checkpoint"):
-        return format_step_output(
-            script="planner",
-            step=f"checkpoint",
-            total=total_steps,
-            title=guidance["title"],
-            actions=guidance["actions"],
-            next_command=guidance.get("next"),
-            is_step_one=False,
-        )
+    # Build step output using W.* API
+    parts = []
 
-    # Use format_step_output for consistent XML formatting
-    return format_step_output(
-        script="planner",
-        step=step,
-        total=total_steps,
-        title=guidance["title"],
-        actions=guidance["actions"],
-        next_command=guidance.get("next"),
-        if_pass=guidance.get("if_pass"),
-        if_fail=guidance.get("if_fail"),
-        is_step_one=(step == 1),
-    )
+    # Step header
+    parts.append(render(
+        W.el("step_header", TextNode(guidance["title"]),
+            script="planner", step=str(step), total=str(total_steps)
+        ).build(),
+        XMLRenderer()
+    ))
+    parts.append("")
+
+    # XML mandate for step 1
+    if step == 1:
+        parts.append("""<xml_format_mandate>
+CRITICAL: All script outputs use XML format. You MUST:
+
+1. Execute the action in <current_action>
+2. When complete, invoke the exact command in <invoke_after>
+3. The <next> block re-states the command -- execute it
+4. For branching <invoke_after>, choose based on outcome:
+   - <if_pass>: Use when action succeeded / QR returned PASS
+   - <if_fail>: Use when action failed / QR returned ISSUES
+
+DO NOT modify commands. DO NOT skip steps. DO NOT interpret.
+</xml_format_mandate>""")
+        parts.append("")
+        parts.append("""<output_efficiency>
+Keep each thinking step to 5 words max. Use notation:
+  -> for implies
+  | for alternatives
+  ; for sequence
+
+Example: "QR failed -> route step 8 | iteration++"
+</output_efficiency>""")
+        parts.append("")
+
+    # Check if there's a next command
+    next_cmd = guidance.get("next")
+    if_pass = guidance.get("if_pass")
+    if_fail = guidance.get("if_fail")
+
+    if next_cmd or (if_pass and if_fail):
+        parts.append("<workflow>")
+
+    # Current action
+    action_nodes = [TextNode(a) for a in guidance["actions"]]
+    parts.append(render(W.el("current_action", *action_nodes).build(), XMLRenderer()))
+    parts.append("")
+
+    # Invoke after
+    if if_pass and if_fail:
+        from skills.lib.workflow.ast.nodes import ElementNode
+        if_pass_node = ElementNode("if_pass", {}, [TextNode(if_pass)])
+        if_fail_node = ElementNode("if_fail", {}, [TextNode(if_fail)])
+        parts.append(render(W.el("invoke_after", if_pass_node, if_fail_node).build(), XMLRenderer()))
+        parts.append("")
+        parts.append(render(
+            W.el("next",
+                TextNode("After current_action completes, execute invoke_after."),
+                TextNode(f"Re-read now: if_pass -> {if_pass}"),
+                TextNode(f"            if_fail -> {if_fail}"),
+                required="true"
+            ).build(),
+            XMLRenderer()
+        ))
+        parts.append("</workflow>")
+    elif next_cmd:
+        parts.append(render(W.el("invoke_after", TextNode(next_cmd)).build(), XMLRenderer()))
+        parts.append("")
+        parts.append(render(
+            W.el("next",
+                TextNode("After current_action completes, execute invoke_after."),
+                TextNode(f"Re-read now: {next_cmd}"),
+                required="true"
+            ).build(),
+            XMLRenderer()
+        ))
+        parts.append("</workflow>")
+
+    return "\n".join(parts)
 
 
-def main():
+def main(
+    step: int = None,
+    total_steps: int = None,
+    qr_iteration: int = 1,
+    qr_fail: bool = False,
+    qr_status: str = None,
+):
+    """Backward compatibility CLI entry point.
+
+    Note: Parameters have defaults because actual values come from argparse.
+    The annotations are metadata for the testing framework.
+    """
     parser = argparse.ArgumentParser(
         description="Interactive Sequential Planner (13-step unified workflow)",
-        epilog="Steps 1-5: planning | Steps 6-13: review with QR gates | 'review' = Plan Review Checkpoint",
+        epilog="Steps 1-5: planning | Steps 6-13: review with QR gates",
     )
 
-    parser.add_argument("--step", type=str, required=True)
+    parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--total-steps", type=int, required=True)
-    parser.add_argument(
-        "--qr-confidence-threshold",
-        type=float,
-        default=80.0,
-        help="Escalate QR findings below this confidence %% (0-100, default 80)",
-    )
     add_qr_args(parser)
 
     args = parser.parse_args()
 
-    # Parse step - can be int or string like "review"
-    try:
-        step = int(args.step)
-    except ValueError:
-        step = args.step  # String step like "review"
-
-    if args.total_steps < 1:
-        print("Error: total-steps must be >= 1", file=sys.stderr)
-        sys.exit(1)
+    if args.step < 1 or args.total_steps < 1:
+        sys.exit("Error: step and total-steps must be >= 1")
 
     if args.total_steps < 13:
-        print("Error: workflow requires at least 13 steps", file=sys.stderr)
-        sys.exit(1)
+        sys.exit("Error: workflow requires at least 13 steps")
 
-    # Validate numeric steps
-    if isinstance(step, int):
-        if step < 1:
-            print("Error: step must be >= 1", file=sys.stderr)
-            sys.exit(1)
+    # Gate steps require --qr-status; provide helpful output if missing
+    if args.step in (7, 10, 13) and not args.qr_status:
+        gate = GATES[args.step]
+        print(f"PLANNER - Step {args.step}/{args.total_steps}: {gate.qr_name} Gate")
+        print()
+        print("This is a gate step. Re-invoke with --qr-status pass or --qr-status fail")
+        print("based on the QR output from the previous step.")
+        sys.exit(0)
 
-        # Gate steps require --qr-status
-        if step in (7, 10, 13) and not args.qr_status:
-            print(f"Error: --qr-status required for gate step {step}", file=sys.stderr)
-            sys.exit(1)
-
-    print(format_output(step, args.total_steps,
-                        args.qr_iteration, args.qr_fail, args.qr_status,
-                        args.qr_confidence_threshold))
+    print(format_output(args.step, args.total_steps,
+                        args.qr_iteration, args.qr_fail, args.qr_status))
 
 
 if __name__ == "__main__":
